@@ -1,7 +1,7 @@
 import express from "express";
 import { chromium } from "playwright";
 
-const VERSION = "3.2.0";
+const VERSION = "3.3.0";
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
 
@@ -462,6 +462,10 @@ async function extractPageBuckets(page, targetNo) {
     '[class*="ProductName"]',
     '[class*="productName"]',
     '[class*="product_name"]',
+    '[class*="product_title"]',
+    '[class*="productTitle"]',
+    'a[class*="product_link"]',
+    'a[href*="/products/"]',
     '[data-testid*="product"] h1',
     "main h1",
     "article h1",
@@ -494,6 +498,8 @@ async function extractPageBuckets(page, targetNo) {
     '[class*="discount"] [class*="price"]',
     '[class*="Price"] strong',
     '[class*="price"] strong',
+    '[class*="price_num"]',
+    '[class*="price"]',
     'strong[class*="price"]',
     '[data-testid*="price"]',
   ];
@@ -563,6 +569,131 @@ async function extractPageBuckets(page, targetNo) {
 
   buckets.push(dom);
   return buckets;
+}
+
+
+function isBrandConnectUrl(value = "") {
+  try {
+    return /(?:^|\.)brandconnect\.naver\.com$/i.test(new URL(value).hostname);
+  } catch {
+    return false;
+  }
+}
+
+async function tryBrandConnectHandoff(page, context, observedUrls) {
+  if (!isBrandConnectUrl(page.url())) return "";
+
+  const directLinks = await page
+    .locator("a[href], [data-href], [data-url], [data-link]")
+    .evaluateAll((nodes) =>
+      nodes.flatMap((node) => [
+        node.href,
+        node.getAttribute("href"),
+        node.getAttribute("data-href"),
+        node.getAttribute("data-url"),
+        node.getAttribute("data-link"),
+      ]).filter(Boolean)
+    )
+    .catch(() => []);
+
+  for (const raw of directLinks) {
+    const url = absoluteUrl(raw, page.url());
+    if (isNaverProductUrl(url)) {
+      observedUrls.add(url);
+      return url;
+    }
+  }
+
+  const clickTargets = page.locator(
+    [
+      'a:has-text("상품 보러가기")',
+      'button:has-text("상품 보러가기")',
+      'a:has-text("구매하러 가기")',
+      'button:has-text("구매하러 가기")',
+      'a:has-text("쇼핑몰로 이동")',
+      'button:has-text("쇼핑몰로 이동")',
+      'a:has-text("상품정보")',
+      'button:has-text("상품정보")',
+      'a:has-text("자세히 보기")',
+      'button:has-text("자세히 보기")',
+      'a:has-text("구매하기")',
+      'button:has-text("구매하기")',
+    ].join(", ")
+  );
+
+  const count = Math.min(await clickTargets.count().catch(() => 0), 8);
+
+  for (let index = 0; index < count; index += 1) {
+    const target = clickTargets.nth(index);
+    if (!(await target.isVisible().catch(() => false))) continue;
+
+    const before = page.url();
+    const popupPromise = context
+      .waitForEvent("page", { timeout: 5000 })
+      .catch(() => null);
+
+    await target
+      .click({ timeout: 5000, force: true })
+      .catch(() => null);
+
+    const popup = await popupPromise;
+    if (popup) {
+      await popup
+        .waitForLoadState("domcontentloaded", { timeout: 12000 })
+        .catch(() => {});
+      await popup.waitForTimeout(1200);
+
+      const popupUrl = popup.url();
+      if (isNaverProductUrl(popupUrl)) {
+        observedUrls.add(popupUrl);
+        await popup.close().catch(() => {});
+        return popupUrl;
+      }
+
+      const popupHtml = await popup.content().catch(() => "");
+      const popupCandidates = extractProductUrls(popupHtml, popupUrl);
+      await popup.close().catch(() => {});
+
+      if (popupCandidates[0]) {
+        observedUrls.add(popupCandidates[0]);
+        return popupCandidates[0];
+      }
+    }
+
+    await page.waitForTimeout(1300);
+    const after = page.url();
+
+    if (isNaverProductUrl(after)) {
+      observedUrls.add(after);
+      return after;
+    }
+
+    if (after !== before && !isBrandConnectUrl(after)) {
+      const html = await page.content().catch(() => "");
+      const candidates = extractProductUrls(html, after);
+      if (candidates[0]) {
+        observedUrls.add(candidates[0]);
+        return candidates[0];
+      }
+    }
+  }
+
+  return "";
+}
+
+async function openNaverShoppingFallback(page, productNo) {
+  if (!productNo) return false;
+
+  const searchUrl =
+    `https://search.shopping.naver.com/search/all?query=${encodeURIComponent(productNo)}`;
+
+  await safeGoto(page, searchUrl, 50000);
+  await page
+    .waitForLoadState("networkidle", { timeout: 12000 })
+    .catch(() => {});
+  await page.waitForTimeout(1800);
+
+  return true;
 }
 
 async function discoverProductUrl(page, observedUrls, bodies, inputUrl) {
@@ -720,12 +851,20 @@ app.post("/extract", async (req, res) => {
       .catch(() => {});
     await page.waitForTimeout(1500);
 
-    let productUrl = await discoverProductUrl(
+    const handoffUrl = await tryBrandConnectHandoff(
       page,
-      observedUrls,
-      observedBodies,
-      resolvedUrl
+      context,
+      observedUrls
     );
+
+    let productUrl =
+      handoffUrl ||
+      (await discoverProductUrl(
+        page,
+        observedUrls,
+        observedBodies,
+        resolvedUrl
+      ));
 
     if (productUrl && productUrl !== page.url()) {
       await safeGoto(page, productUrl);
@@ -733,6 +872,15 @@ app.post("/extract", async (req, res) => {
         .waitForLoadState("networkidle", { timeout: 12000 })
         .catch(() => {});
       await page.waitForTimeout(1500);
+    } else if (!productUrl && targetNo) {
+      await openNaverShoppingFallback(page, targetNo);
+      productUrl =
+        (await discoverProductUrl(
+          page,
+          observedUrls,
+          observedBodies,
+          page.url()
+        )) || page.url();
     }
 
     await page
@@ -791,7 +939,9 @@ app.post("/extract", async (req, res) => {
 
     const diagnostics = {
       version: VERSION,
+      inputUrl: input.href,
       resolvedUrl,
+      targetProductNo: targetNo,
       productUrl: page.url(),
       productNo: currentNo,
       nameCandidates: merged.names.length,
