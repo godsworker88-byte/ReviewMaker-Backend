@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: reviewmaker-ai
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
